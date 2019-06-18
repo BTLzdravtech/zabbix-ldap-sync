@@ -417,7 +417,7 @@ class ZabbixConn(object):
             for elem in self.media_opt:
                 if elem[0] == "onlycreate" and elem[1].lower() == "true":
                     onlycreate = True
-                if elem[0] == "severity":
+                elif elem[0] == "severity":
                     media_opt_filtered.append(
                         (elem[0], self.convert_severity(elem[1]))
                     )

@@ -1,8 +1,11 @@
+import collections
 import logging
 import random
-import string
-import collections
 import re
+import string
+import sys
+from functools import lru_cache
+from typing import Dict, Optional, Tuple, List
 
 from pyzabbix import ZabbixAPI, ZabbixAPIException
 
@@ -16,49 +19,74 @@ class ZabbixConn(object):
     """
 
     def __init__(self, config, ldap_conn):
+        self.conn = None
         self.ldap_conn = ldap_conn
         self.server = config.zbx_server
         self.username = config.zbx_username
         self.password = config.zbx_password
+        self.apitoken = config.zbx_apitoken
+        self.alldirusergroup = config.zbx_alldirusergroup
         self.auth = config.zbx_auth
         self.dryrun = config.dryrun
-        self.nocheckcertificate = config.zbx_nocheckcertificate
+        self.nocheckcertificate = config.zbx_ignore_tls_errors
+        self.preserve_accountids = config.ldap_accountids
         self.ldap_groups = config.ldap_groups
         self.ldap_media = config.ldap_media
         self.media_opt = config.media_opt
         self.deleteorphans = config.zbx_deleteorphans
-        self.media_description = config.media_description
+        self.removeabsent = config.zbx_removeabsent
+        self.media_name = config.media_name
         self.user_opt = config.user_opt
         if self.nocheckcertificate:
             from requests.packages.urllib3 import disable_warnings
             disable_warnings()
 
         if config.ldap_wildcard_search:
-            self.ldap_groups = ldap_conn.get_groups_with_wildcard()
+            self.ldap_groups = ldap_conn.get_groups_with_wildcard(self.ldap_groups)
 
         # Use logger to log information
-        self.logger = logging.getLogger()
-        if config.verbose:
-            self.logger.setLevel(logging.DEBUG)
-        else:
-            self.logger.setLevel(logging.INFO)
-        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        self.logger = logging.getLogger(self.__class__.__name__)
 
-        # Log to stdout
-        ch = logging.StreamHandler()
-        if config.verbose:
-            ch.setLevel(logging.DEBUG)
+        self.username_attribute = "alias"
 
-        ch.setFormatter(formatter)
-        self.logger.addHandler(ch)  # Use logger to log information
+    @lru_cache()
+    def get_api_minor_version(self) -> float:
+        version_str = self.conn.api_version()
+        m = re.match(r"(\d+\.\d+)\.\d+", version_str)
+        if m:
+            version_str = m.group(1)
+        return float(version_str)
 
-        # Log from pyzabbix
-        log = logging.getLogger('pyzabbix')
-        log.addHandler(ch)
-        if config.verbose:
-            log.setLevel(logging.DEBUG)
+    @lru_cache()
+    def _get_group_id(self, group_name: str) -> int:
+        zabbix_group_id = None
+        self.logger.debug(f"Lookup for groupid >>{group_name}<<")
+        for g in self._get_groups():
+            if g['name'] == group_name:
+                zabbix_group_id = g['usrgrpid']
+                break
+        if not zabbix_group_id:
+            self.logger.fatal(f"unable to find group >>{group_name}<<")
+            sys.exit(3)
+        return zabbix_group_id
 
-    def connect(self):
+    @lru_cache()
+    def _get_role_id(self, role_name: str) -> int:
+        zabbix_role_id = None
+        self.logger.debug(f"Lookup for role id >>{role_name}<<")
+        for g in self._get_roles():
+            if g['name'] == role_name:
+                zabbix_role_id = g['roleid']
+                break
+            if g['roleid'] == role_name:
+                zabbix_role_id = g['roleid']
+                break
+        if not zabbix_role_id:
+            self.logger.fatal(f"unable to find role >>{role_name}<<")
+            sys.exit(3)
+        return int(zabbix_role_id)
+
+    def connect(self) -> bool:
         """
         Establishes a connection to the Zabbix server
 
@@ -67,7 +95,7 @@ class ZabbixConn(object):
 
         """
 
-        if self.auth == "webform":
+        if self.auth in ["webform", "token"]:
             self.conn = ZabbixAPI(self.server)
         elif self.auth == "http":
             self.conn = ZabbixAPI(self.server, use_authenticate=False)
@@ -80,13 +108,21 @@ class ZabbixConn(object):
             self.conn.session.verify = False
 
         try:
-            self.conn.login(self.username, self.password)
+            self.conn.login(self.username, self.password, api_token=self.apitoken)
         except ZabbixAPIException as e:
             raise SystemExit('Cannot login to Zabbix server: %s' % e)
 
         self.logger.info("Connected to Zabbix API Version %s" % self.conn.api_version())
 
-    def get_users(self):
+        if self.get_api_minor_version() > 5.2:
+            self.username_attribute = "username"
+
+        return True
+
+    def get_users(self) -> List[dict]:
+        return self.conn.user.get(output='extend')
+
+    def get_users_names(self) -> List[str]:
         """
         Retrieves the existing Zabbix users
 
@@ -94,24 +130,31 @@ class ZabbixConn(object):
             A list of the existing Zabbix users
 
         """
-        result = self.conn.user.get(output='extend')
+        result = self.get_users()
 
-        users = [user['alias'] for user in result]
-
+        if self.preserve_accountids:
+            users = [user[self.username_attribute] for user in result]
+        else:
+            users = [user[self.username_attribute].lower() for user in result]
         return users
 
-    def get_mediatype_id(self, description):
+    def get_mediatype_id(self, name: str) -> Optional[str]:
         """
-        Retrieves the mediatypeid by description
+        Retrieves the mediatypeid by name
 
         Args:
-            description (str): Zabbix media type description
+            name (str): Zabbix media type name
 
         Returns:
-            The mediatypeid for specified media type description
+            The mediatypeid for specified media type name
 
         """
-        result = self.conn.mediatype.get(filter={'description': description})
+        result = self.conn.mediatype.get(filter={'name': name.strip()})
+
+        if len(result) < 1:
+            raise Exception(f"No such media for {name} found, check your configuration")
+        elif len(result) > 1:
+            raise Exception(f"Ambiguous media '{name}' found, {len(result)} different medias")
 
         if result:
             mediatypeid = result[0]['mediatypeid']
@@ -120,7 +163,7 @@ class ZabbixConn(object):
 
         return mediatypeid
 
-    def get_user_id(self, user):
+    def get_user_id(self, user: str) -> Optional[str]:
         """
         Retrieves the userid of a specified user
 
@@ -131,13 +174,15 @@ class ZabbixConn(object):
             The userid of the specified user
 
         """
-        result = self.conn.user.get(output='extend')
+        result = self.get_users()
 
-        userid = [u['userid'] for u in result if u['alias'].lower() == user].pop()
+        userids = [u['userid'] for u in result if u[self.username_attribute].lower() == user]
+        if len(userids) == 1:
+            return userids[0]
+        else:
+            return None
 
-        return userid
-
-    def get_groups(self):
+    def _get_groups(self):
         """
         Retrieves the existing Zabbix groups
 
@@ -145,10 +190,21 @@ class ZabbixConn(object):
             A dict of the existing Zabbix groups and their group ids
 
         """
-        result = self.conn.usergroup.get(status=0, output='extend')
-
+        result = self.conn.usergroup.get(output='extend')
         groups = [{'name': group['name'], 'usrgrpid': group['usrgrpid']} for group in result]
 
+        return groups
+
+    def _get_roles(self):
+        """
+        Retrieves the existing Zabbix groups
+
+        Returns:
+            A dict of the existing Zabbix groups and their group ids
+
+        """
+        result = self.conn.role.get(output='extend')
+        groups = [{'name': group['name'], 'roleid': group['roleid']} for group in result]
         return groups
 
     def get_group_members(self, groupid):
@@ -164,7 +220,7 @@ class ZabbixConn(object):
         """
         result = self.conn.user.get(output='extend', usrgrpids=groupid)
 
-        users = [user['alias'] for user in result]
+        users = [user[self.username_attribute] for user in result]
 
         return users
 
@@ -185,7 +241,7 @@ class ZabbixConn(object):
 
         return groupid
 
-    def create_user(self, user, groupid, user_opt):
+    def create_user(self, user: Dict, groupid: int, user_opt: Dict[str, str], password: str, role_id: Optional[int]):
         """
         Creates a new Zabbix user
 
@@ -193,16 +249,27 @@ class ZabbixConn(object):
             user     (dict): A dict containing the user details
             groupid   (int): The groupid for the new user
             user_opt (dict): User options
-
+            password  (str): The user password
+            role_id   (int): Numeric id of the role for the user
         """
-        random_passwd = ''.join(random.sample(string.ascii_letters + string.digits, 32))
+        user_settings = {'autologin': 0, 'usrgrps': [{'usrgrpid': str(groupid)}], 'passwd': password}
 
-        user_defaults = {'autologin': 0, 'type': 1, 'usrgrps': [{'usrgrpid': str(groupid)}], 'passwd': random_passwd}
-        user_defaults.update(user_opt)
-        user.update(user_defaults)
+        for opt, value in user_opt.items():
+            if opt == "show_password":
+                continue
+            else:
+                user_settings[opt] = value
 
+        if role_id:
+            if self.get_api_minor_version() > 5.2:
+                user_settings['roleid'] = int(role_id)
+            else:
+                user_settings['type'] = int(role_id)
+
+        if "role" in user_settings:
+            del user_settings['role']
+        user.update(user_settings)
         result = self.conn.user.create(user)
-
         return result
 
     def delete_user(self, user):
@@ -219,33 +286,61 @@ class ZabbixConn(object):
 
         return result
 
-    def update_user(self, user, groupid):
+    def update_user(self, user: str, group_id: int):
         """
         Adds an existing Zabbix user to a group
 
         Args:
             user    (dict): A dict containing the user details
-            groupid  (int): The groupid to add the user to
+            group_id  (int): The groupid to add the user to
 
         """
         userid = self.get_user_id(user)
 
-        if self.conn.api_version() >= "3.4":
-          members = self.conn.usergroup.get(usrgrpids=[str(groupid)],selectUsers='extended')
-          grpusers = members[0]['users']
-          userids = set()
-          for u in grpusers:
-            userids.add(u['userid'])
-          userids.add(str(userid))
-          if not self.dryrun:
-            result = self.conn.usergroup.update(usrgrpid=str(groupid), userids=list(userids))
+        result = None
+
+        if self.get_api_minor_version() > 3.2:
+            members = self.conn.usergroup.get(usrgrpids=[str(group_id)], selectUsers='extended')
+            group_users = members[0]['users']
+            user_ids = set()
+            for u in group_users:
+                user_ids.add(u['userid'])
+            user_ids.add(str(userid))
+
+            if not self.dryrun:
+                result = self.conn.usergroup.update(usrgrpid=str(group_id), userids=list(user_ids))
         else:
-          if not self.dryrun:
-            result = self.conn.usergroup.massadd(usrgrpids=[str(groupid)], userids=[str(userid)])
+            if not self.dryrun:
+                result = self.conn.usergroup.massadd(usrgrpids=[str(group_id)], userids=[str(userid)])
 
         return result
 
-    def update_media(self, user, description, sendto, media_opt):
+    def remove_user(self, user: str, group_id: int):
+        """
+        Remove existing Zabbix user from group
+
+        Args:
+            user    (dict): A dict containing the user details
+            group_id  (int): The groupid to add the user to
+
+        """
+        userid = self.get_user_id(user)
+
+        result = None
+
+        if self.get_api_minor_version() > 3.2:
+            members = self.conn.usergroup.get(usrgrpids=[str(group_id)], selectUsers='extended')
+            group_users = members[0]['users']
+            user_ids = set()
+            for u in group_users:
+                if u['userid'] != userid:
+                    user_ids.add(u['userid'])
+            if not self.dryrun:
+                result = self.conn.usergroup.update(usrgrpid=str(group_id), userids=list(user_ids))
+
+        return result
+
+    def update_media(self, user: str, description: str, sendto: str, media_opt: list):
         """
         Adds media to an existing Zabbix user
 
@@ -270,7 +365,11 @@ class ZabbixConn(object):
             }
             media_defaults.update(media_opt)
 
-            if self.conn.api_version() >= "3.4":
+            for unwanted_attrib in ["description", "name", "onlycreate"]:
+                if unwanted_attrib in media_defaults:
+                    del media_defaults[unwanted_attrib]
+
+            if self.get_api_minor_version() > 3.2:
                 result = self.conn.user.update(userid=str(userid), user_medias=[media_defaults])
             else:
                 self.delete_media_by_description(user, description)
@@ -280,7 +379,7 @@ class ZabbixConn(object):
 
         return result
 
-    def delete_media_by_description(self, user, description):
+    def delete_media_by_description(self, user: str, description: str):
         """
         Remove all media from user (with specific mediatype)
 
@@ -299,17 +398,26 @@ class ZabbixConn(object):
 
             if media_ids:
                 self.logger.info('Remove other exist media from user %s (type=%s)' % (user, description))
-                for id in media_ids:
-                    self.conn.user.deletemedia(id)
+                for media_id in media_ids:
+                    self.conn.user.deletemedia(media_id)
 
     def create_missing_groups(self):
         """
         Creates any missing LDAP groups in Zabbix
 
         """
-        missing_groups = set(self.ldap_groups) - set([g['name'] for g in self.get_groups()])
 
+        groups = []
+        for group_spec in self.ldap_groups:
+            name, _ = self._get_group_spec(group_spec)
+            groups.append(name)
+        if not self.alldirusergroup:
+            groups.append(self.alldirusergroup)
+
+        missing_groups = set(groups) - set([g['name'] for g in self._get_groups()])
         for eachGroup in missing_groups:
+            if not eachGroup:
+                continue
             self.logger.info('Creating Zabbix group %s' % eachGroup)
             if not self.dryrun:
                 grpid = self.create_group(eachGroup)
@@ -319,7 +427,7 @@ class ZabbixConn(object):
 
         converted_severity = severity.strip()
 
-        if re.match("\d+", converted_severity):
+        if re.match(r"\d+", converted_severity):
             return converted_severity
 
         sev_entries = collections.OrderedDict({
@@ -342,7 +450,7 @@ class ZabbixConn(object):
             str_bitmask += digit
 
         converted_severity = str(int(str_bitmask, 2))
-        self.logger.info('Converted severity "%s" to "%s"' % (severity, converted_severity))
+        self.logger.debug('Converted severity "%s" to "%s"' % (severity, converted_severity))
 
         return converted_severity
 
@@ -352,66 +460,107 @@ class ZabbixConn(object):
         """
 
         self.ldap_conn.connect()
-        zabbix_all_users = self.get_users()
-        # Lowercase list of user
-        zabbix_all_users = [x.lower() for x in zabbix_all_users]
+        if self.alldirusergroup:
+            zabbix_alldirusergroup_id = self._get_group_id(self.alldirusergroup)
+            zabbix_alldirusergroup_users = self.get_group_members(zabbix_alldirusergroup_id)
+        else:
+            zabbix_alldirusergroup_id = None
+            zabbix_alldirusergroup_users = []
 
-        for eachGroup in self.ldap_groups:
+        for group_spec in self.ldap_groups:
 
-            ldap_users = self.ldap_conn.get_group_members(eachGroup)
-            # Lowercase list of users
-            ldap_users = {k.lower(): v for k,v in ldap_users.items()}
+            group_name, role_id = self._get_group_spec(group_spec)
+
+            self.logger.info('Processing group >>>%s<<<...' % group_name)
+            zabbix_all_users = self.get_users_names()
+
+            if self.preserve_accountids:
+                ldap_users = {k: v for k, v in self.ldap_conn.get_group_members(group_name).items()}
+            else:
+                ldap_users = {k.lower(): v for k, v in self.ldap_conn.get_group_members(group_name).items()}
 
             # Do nothing if LDAP group contains no users and "--delete-orphans" is not specified
-            if not ldap_users and not self.deleteorphans:
+            if not ldap_users and not self.deleteorphans and not self.removeabsent:
+                self.logger.info('Done for group %s. Nothing to do' % group_name)
                 continue
 
-            zabbix_grpid = [g['usrgrpid'] for g in self.get_groups() if g['name'] == eachGroup].pop()
+            zabbix_group_id = self._get_group_id(group_name)
 
-            zabbix_group_users = self.get_group_members(zabbix_grpid)
+            zabbix_group_users = self.get_group_members(zabbix_group_id)
 
-            missing_users = set(list(ldap_users.keys())) - set(zabbix_group_users)
-
+            missing_users = set(ldap_users.keys()) - set(zabbix_group_users)
             # Add missing users
-            for eachUser in missing_users:
-
+            self.logger.info('Syncing users...')
+            for each_user in missing_users:
                 # Create new user if it does not exists already
-                if eachUser not in zabbix_all_users:
-                    self.logger.info('Creating user "%s", member of Zabbix group "%s"' % (eachUser, eachGroup))
-                    user = {'alias': eachUser}
+                if each_user not in zabbix_all_users:
+                    random_passwd = ''.join(random.sample(string.ascii_letters + string.digits, 32))
+                    for opt, value in self.user_opt.items():
+                        if opt == "show_password" and value.lower() == "true":
+                            self.logger.info(f"Created user {each_user}, start password" +
+                                             f" {random_passwd} and membership of Zabbix group >>{group_name}<<")
+                        else:
+                            self.logger.info(
+                                f"Created user {each_user} and membership of Zabbix group >>{group_name}<<")
+                    user = {self.username_attribute: each_user}
 
-                    if self.ldap_conn.get_user_givenName(ldap_users[eachUser]) is None:
+                    if self.ldap_conn.get_user_givenName(ldap_users[each_user]) is None:
                         user['name'] = ''
                     else:
-                        user['name'] = self.ldap_conn.get_user_givenName(ldap_users[eachUser]).decode('utf8')
-                    if self.ldap_conn.get_user_sn(ldap_users[eachUser]) is None:
+                        user['name'] = self.ldap_conn.get_user_givenName(ldap_users[each_user]).decode('utf8')
+                    if self.ldap_conn.get_user_sn(ldap_users[each_user]) is None:
                         user['surname'] = ''
                     else:
-                        user['surname'] = self.ldap_conn.get_user_sn(ldap_users[eachUser]).decode('utf8')
+                        user['surname'] = self.ldap_conn.get_user_sn(ldap_users[each_user]).decode('utf8')
 
                     if not self.dryrun:
-                      self.create_user(user, zabbix_grpid, self.user_opt)
-                    zabbix_all_users.append(eachUser)
+                        self.create_user(user=user, groupid=zabbix_group_id, user_opt=self.user_opt,
+                                         password=random_passwd, role_id=role_id)
+                    zabbix_all_users.append(each_user)
                 else:
                     # Update existing user to be member of the group
-                    self.logger.info('Updating user "%s", adding to group "%s"' % (eachUser, eachGroup))
+                    self.logger.info('Updating user "%s", adding to group "%s"' % (each_user, group_name))
                     if not self.dryrun:
-                      self.update_user(eachUser, zabbix_grpid)
+                        self.update_user(each_user, zabbix_group_id)
 
-            # Handle any extra users in the groups
-            extra_users = set(zabbix_group_users) - set(list(ldap_users.keys()))
-            if extra_users:
-                self.logger.info('Users in group %s which are not found in LDAP group:' % eachGroup)
+            # Add users to Zabbix all directory users
+            if zabbix_alldirusergroup_id:
+                self.logger.info('Adding users to group %s...' % self.alldirusergroup)
+                missing_allusers = set(list(ldap_users.keys())) - set(zabbix_alldirusergroup_users)
+                for each_user in missing_allusers:
+                    self.logger.info('Updating user "%s", adding to group "%s"' % (each_user, self.alldirusergroup))
+                    self.update_user(each_user, zabbix_alldirusergroup_id)
 
-                for eachUser in extra_users:
+            # Handle any extra users in the group
+            self.logger.info('Handle extra users...')
+            absent_users = set(zabbix_group_users) - set(list(ldap_users.keys()))
+            count = 0
+            if absent_users:
+                for each_user in absent_users:
+                    if zabbix_alldirusergroup_id and each_user not in zabbix_alldirusergroup_users:
+                        continue
+                    count = count + 1
+                    if count == 1:
+                        self.logger.info('Users in group %s which are not found in LDAP group:' % group_name)
                     if self.deleteorphans:
-                        self.logger.info('Deleting user: "%s"' % eachUser)
+                        self.logger.info('Deleting user: "%s"' % each_user)
                         if not self.dryrun:
-                            self.delete_user(eachUser)
+                            try:
+                                self.delete_user(each_user)
+                            except Exception as e:
+                                self.logger.error('Error deleting user "%s"' % each_user)
+                                self.logger.error(e)
                     else:
-                        self.logger.info('User not in ldap group "%s"' % eachUser)
+                        self.logger.info('User not in ldap group "%s"' % each_user)
+                        if self.removeabsent:
+                            self.logger.info('Removing user from group: "%s"...' % each_user)
+                            if not self.dryrun:
+                                self.remove_user(each_user, zabbix_group_id)
+            # if count == 0:
+            #     self.logger.info('No absent users')
 
             # update users media
+            self.logger.info('Updating media for users...')
             onlycreate = False
             media_opt_filtered = []
             for elem in self.media_opt:
@@ -425,25 +574,56 @@ class ZabbixConn(object):
                     media_opt_filtered.append(elem)
 
             if onlycreate:
-                self.logger.info("Add media only on newly created users for group >>>%s<<<" % eachGroup)
+                self.logger.info("Add media only on newly created users for group >>>%s<<<" % group_name)
                 zabbix_group_users = missing_users
             else:
-                self.logger.info("Update media on all users for group >>>%s<<<" % eachGroup)
-                zabbix_group_users = self.get_group_members(zabbix_grpid)
+                self.logger.info("Update media on all users for group >>>%s<<<" % group_name)
+                zabbix_group_users = self.get_group_members(zabbix_group_id)
 
-            for eachUser in set(zabbix_group_users):
-                eachUser = eachUser.lower()
+            for each_user in set(zabbix_group_users):
+                if not self.preserve_accountids:
+                    each_user = each_user.lower()
 
                 if self.ldap_media:
-                    self.logger.info('>>> Updating/create user media for "%s", update "%s"' % (eachUser, self.media_description))
-                    if self.ldap_conn.get_user_media(ldap_users[eachUser], self.ldap_media):
-                        sendto = self.ldap_conn.get_user_media(ldap_users[eachUser], self.ldap_media).decode("utf8")
+                    if self.ldap_conn.get_user_media(ldap_users[each_user], self.ldap_media):
+                        sendto = self.ldap_conn.get_user_media(ldap_users[each_user], self.ldap_media).decode("utf8")
                     else:
-                        sendto = self.ldap_conn.get_user_media(ldap_users[eachUser], self.ldap_media)
+                        sendto = self.ldap_conn.get_user_media(ldap_users[each_user], self.ldap_media)
 
-                    if sendto and not self.dryrun:
-                        self.update_media(eachUser, self.media_description, sendto, media_opt_filtered)
+                    if each_user not in absent_users and sendto is not None and not self.dryrun:
+                        self.logger.info(
+                            '>>> Updating/create user media for "%s", update "%s"' % (each_user, self.media_name))
+                        self.update_media(each_user, self.media_name, sendto, media_opt_filtered)
                 else:
-                    self.logger.info('>>> Ignoring media for "%s" because of configuration' % (eachUser))
+                    self.logger.info('>>> Ignoring media for "%s" because of configuration' % each_user)
+            self.logger.info('Done for group %s' % group_name)
 
         self.ldap_conn.disconnect()
+        self.logger.info('Done!')
+
+    def _get_group_spec(self, group_spec: str) -> Tuple[str, int]:
+        m = re.match(r"^(.+):(\d+)$", group_spec)
+        if m:
+            group_name = m.group(1).strip()
+            role_id = int(m.group(2).strip())
+            return group_name, role_id
+
+        m = re.match(r"^(.+):(.+)$", group_spec)
+        if m:
+            group_name = m.group(1).strip()
+            role_id = int(self._get_role_id(m.group(2).strip()))
+            return group_name, role_id
+
+        if "role" in self.user_opt:
+            lookup_key = "role"
+        elif "type" in self.user_opt:
+            lookup_key = "type"
+        else:
+            self.logger.fatal("No default role specified")
+            self.logger.fatal("user_opt:")
+            self.logger.fatal(self.user_opt)
+            sys.exit(3)
+
+        group_name = group_spec
+        role_id = int(self._get_role_id(self.user_opt[lookup_key]))
+        return group_name, role_id

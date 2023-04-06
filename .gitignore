@@ -1,6 +1,14 @@
 *~
 \#*
-zabbix-ldap*.conf
+*.conf
+config/
 lib/__pycache__/*
 *.pyc
+*.swo
+*.swp
+venv
+.idea
+.vscode
+do
+template*.jinja
 venv

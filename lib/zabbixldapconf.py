@@ -73,7 +73,8 @@ class ZabbixLDAPConf(object):
                                                   fallback='(&(objectClass=posixAccount)(uid=%s))', raw=True)
             self.openldap_groupattribute = parser.get('openldap', 'groupattribute', fallback='memberUid', raw=True)
             self.openldap_userattribute = parser.get('openldap', 'userattribute', fallback='uid', raw=True)
-
+            self.openldap_truncatedn = ZabbixLDAPConf.try_get_item_bool(parser, 'openldap', 'truncatedn', False)
+            
             self.zbx_server = parser.get('zabbix', 'server')
 
             self.zbx_ignore_tls_errors = ZabbixLDAPConf.try_get_item_bool(parser, 'zabbix', 'ignore_tls_errors', False)

@@ -31,6 +31,7 @@ class LDAPConn(object):
         self.user_filter = config.ldap_user_filter
         self.verbose = config.verbose
         self.openldap_type = config.openldap_type
+        self.openldap_truncatedn = config.openldap_truncatedn
 
         self.logger = logging.getLogger(self.__class__.__name__)
         # Log from pyldap
@@ -110,6 +111,10 @@ class LDAPConn(object):
         # Get info for each user in the group
         for memberid in users[self.group_member_attribute]:
             memberid = memberid.decode("utf-8")
+
+            if self.openldap_truncatedn:
+                self.logger.debug('Distinguished name truncated from %s to %s' % (memberid, memberid.split(',')[0]))
+                memberid = memberid.split(',')[0]
 
             if self.openldap_type == "groupofnames":
                 filter = "(objectClass=*)"

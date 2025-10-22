@@ -90,6 +90,7 @@ In order to use the *zabbix-ldap-sync* script we need to create a configuration 
 * `filteruser` = The ldap filter to get the users in OpenLDAP mode, by default `(&(objectClass=posixAccount)(uid=%s))`
 * `groupattribute` = The attribute used for membership in a group in OpenLDAP mode, by default `memberUid`
 * `userattribute` = The attribute for users in openldap mode, by default `uid`
+* `truncatedn` - If set to true the distinguished name (DN) will be truncated to the first component (by default false). Group members are usually defined as `full-path-DN`. If your ldap server just uses the `login` names to reference group members (i.e. FreeIPA) you can use this functionality to solve problems with broken searches. Example: `uid=testuser,cn=users,cn=accounts,dc=example,dc=com` cut to `uid=testuser`
 
 #### [zabbix]
 * `server` - Zabbix URL

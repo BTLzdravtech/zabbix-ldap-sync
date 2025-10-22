@@ -369,7 +369,9 @@ class ZabbixConn(object):
                 if unwanted_attrib in media_defaults:
                     del media_defaults[unwanted_attrib]
 
-            if self.get_api_minor_version() > 3.2:
+            if self.get_api_minor_version() > 5.2:
+                result = self.conn.user.update(userid=str(userid), medias=[media_defaults])
+            elif self.get_api_minor_version() > 3.2:
                 result = self.conn.user.update(userid=str(userid), user_medias=[media_defaults])
             else:
                 self.delete_media_by_description(user, description)
